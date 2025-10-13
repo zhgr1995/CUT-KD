@@ -1,5 +1,7 @@
 CUT-KD: Coverage-Aware Utility-Weighted Two-Stage Knowledge Distillation
 长尾识别中的覆盖感知、效用加权双阶段知识蒸馏框架
+
+
 🧠 Overview / 概述
 CUT-KD 是一个用于长尾分类（long-tailed recognition）的知识蒸馏框架，结合了：
 覆盖感知（Coverage-Aware） 的多教师协同；
@@ -7,6 +9,8 @@ CUT-KD 是一个用于长尾分类（long-tailed recognition）的知识蒸馏�
 熵触发（Entropy-Triggered） 的学生适配分支。
 其目标是在类别不平衡的情况下提升尾部类（rare classes）的识别性能，同时保持计算预算不变。
 论文链接（推荐阅读）：https://github.com/zhgr1995/CUT-KD
+
+
 ⚙️ Features / 特性
 模块	功能描述	英文简述
 多教师路由 (Multi-Teacher Routing)	根据类别分段（头/中/尾）动态分配教师网络	Assigns different teachers to sample segments
@@ -14,6 +18,8 @@ CUT-KD 是一个用于长尾分类（long-tailed recognition）的知识蒸馏�
 一次剪枝 (One-shot Pruning)	移除低效教师网络以减少冲突	Removes weak teachers by competence ratio
 熵触发适配器 (Entropy-Triggered Adapter)	不确定样本激活轻量学生分支	Activates adapter branch for uncertain samples
 双阶段蒸馏 (Two-Stage Distillation)	早期全局蒸馏 + 后期覆盖蒸馏	Global KD early + coverage-aware KD later
+
+
 📦 Dependencies / 环境依赖
 Python ≥ 3.8
 PyTorch ≥ 2.0
@@ -23,6 +29,8 @@ scikit-learn
 tensorboardX (可选，用于日志)
 安装命令：
 pip install torch torchvision numpy scikit-learn tensorboardX tqdm
+
+
 🚀 Usage / 使用方法
 1️⃣ 示例命令（CIFAR-10-LT）
 python cut-kd.py \
@@ -48,30 +56,9 @@ python cut-kd.py \
 --rho	适配器混合系数	0.2
 --tau_pct	熵触发百分位阈值	80
 --out_dir	输出目录	./results
-📊 Results / 实验结果
-在 CIFAR-10/100-LT、ImageNet-LT、Places-LT 上均优于主流方法。
-CUT-KD 在 尾部类准确率 和 校准误差（ECE） 上取得显著提升，同时保持推理阶段计算量不变
-CUT_KD
-。
-Dataset	Baseline	CUT-KD	Tail Acc ↑
-CIFAR-100-LT	RIDE	+2.6%	
-ImageNet-LT	LTRL	+3.8%	
-Places-LT	MiSLAS	+4.1%	
-🧩 Code Structure / 代码结构
-cut-kd.py
-├── AverageMeter, topk, seg_split  # 公共指标工具
-├── TwoViewsDataset                # 数据加载类
-├── CifarResNet18 / Student        # 学生网络 + 适配器结构
-├── TeacherBank                    # 教师融合与剪枝逻辑
-└── train()                        # 主训练流程与参数解析
-🧪 Citation / 引用格式
-If you use this code or paper, please cite:
-@article{zhu2025cutkd,
-  title={CUT-KD: Coverage-Aware Utility-Weighted Two-Stage Knowledge Distillation for Long-Tailed Recognition},
-  author={Zhu, Guorui},
-  journal={Data Mining and Knowledge Discovery},
-  year={2025}
-}
+
+
+
 📬 Contact / 联系方式
 Institute of Big Data, Southwestern University of Finance and Economics
 Email: 1221201z5007@smail.swufe.edu.cn
