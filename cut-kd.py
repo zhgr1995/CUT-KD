@@ -120,7 +120,6 @@ def cifar_loaders(cfg):
         idx = [int(i) for i in f.read().split()]
 
     full_train      = Data(cfg['datapath'], True,  download=True, transform=T_train)
-    full_train_raw  = Data(cfg['datapath'], True,  download=True, transform=None)
     train_set       = SubsetWithIndex(full_train, idx)  # << 仅在这里多返回 global_idx
     val_set         = Data(cfg['datapath'], False, download=True, transform=T_test)
 
@@ -131,17 +130,9 @@ def cifar_loaders(cfg):
     u_loader = DataLoader(train_set, cfg['batch_size'],
                           sampler=RandomSampler(train_set),
                           num_workers=6, pin_memory=True, drop_last=True)
-    diff_sampler = DifficultySampler(labels, cfg['lambda_rs'])
-    r_loader = DataLoader(train_set, cfg['batch_size'],
-                          sampler=diff_sampler,
-                          num_workers=6, pin_memory=True, drop_last=True)
-    bt_set = TwoViewsDataset(full_train_raw, idx, T_train, T_train)
-    bt_loader = DataLoader(bt_set, cfg['batch_size'],
-                           shuffle=True, num_workers=6, pin_memory=True, drop_last=True)
     val_loader = DataLoader(val_set, cfg['batch_size'],
                             shuffle=False, num_workers=6, pin_memory=True)
-    return u_loader, r_loader, val_loader, labels, diff_sampler, bt_loader, np.array(idx, dtype=np.int64), len(full_train)
-
+    return u_loader, val_loader, labels, np.array(idx, dtype=np.int64), len(full_train)
 # -------------------- 学生网络（共享骨干 + 主头 + 适配器） --------------------
 class CifarResNet18(nn.Module):
     """ResNet-18 (conv3-s1, 无 maxpool) 输出 512-d；与原骨干一致。"""
@@ -194,32 +185,23 @@ class Student(nn.Module):
     def __init__(self, ncls=10, rho=0.2):
         super().__init__()
         self.backbone = CifarResNet18()
-        self.s0 = HeadMLP(self.backbone.out_dim, ncls)
+        self.s0 = HeadMLP(self.backbone.out_dim, ncls)  # 主学生
         self.adp = HeadMLP(self.backbone.out_dim, ncls)  # 适配器 C
-        self.use_s1 = False
-        self.s1 = HeadMLP(self.backbone.out_dim, ncls)   # 预备的第二学生
         self.rho = rho
-        # 全局阈值 τ（训练中估计后注入；推理沿用）
-        self.tau = float('inf')  # epoch<1 前不触发适配器
+        self.tau = float('inf')
     @staticmethod
     def _softmax_logit(logits):  # 返回 (p, logp)
         p = F.softmax(logits, -1)
         return p, (p+1e-12).log()
     @torch.no_grad()
     def predict(self, x: torch.Tensor) -> torch.Tensor:
-        """推理：不使用教师，仅按 τ 用适配器混合；返回 log-prob 以配合 evaluate。"""
         z = self.backbone(x)
-        p0, _logp0 = self._softmax_logit(self.s0(z))
-        # 参考分布（无教师时用 p0）
-        pref = p0
-        d = -(pref * (pref+1e-12).log()).sum(-1)  # 熵
+        p0 = F.softmax(self.s0(z), -1)
+        d = -(p0 * (p0+1e-12).log()).sum(-1)
         trigger = (d > self.tau).float().unsqueeze(-1)
-        if self.use_s1:
-            p1, _ = self._softmax_logit(self.s1(z))
-            pS = torch.where(trigger.bool(), (1-self.rho)*p0 + self.rho*p1, p0)
-        else:
-            pC, _ = self._softmax_logit(self.adp(z))
-            pS = torch.where(trigger.bool(), (1-self.rho)*p0 + self.rho*pC, p0)
+        
+        pC = F.softmax(self.adp(z), -1)
+        pS = torch.where(trigger.bool(), (1-self.rho)*p0 + self.rho*pC, p0)
         return (pS+1e-12).log()
 
 # -------------------- 离线教师缓存与融合（新理论） --------------------
@@ -243,12 +225,14 @@ class TeacherCache:
         self.scales = [1.0, 1.0, 1.0]
         self.Z = [None, None, None]  # CPU tensors
         for k, p in enumerate(paths):
-            if p is None: continue
-            arr = self._load_array(p)  # [N_full, C]
+            if p is None: 
+                continue
+            arr = self._load_array(p)
             assert arr.shape[0] == n_full, f"Teacher {k} N mismatch: {arr.shape[0]} vs {n_full}"
             assert arr.shape[1] == ncls, f"Teacher {k} C mismatch: {arr.shape[1]} vs {ncls}"
-            self.Z[k] = torch.from_numpy(arr.astype(np.float32)).to(self.device)  # 直接放 device
-            self.scales[k] = float(self.scales[k])
+            self.Z[k] = torch.from_numpy(arr.astype(np.float32)).to(self.device)
+            self.present[k] = True  # ✅ 必须设置
+            self.scales[k] = 1.0    # 初始化为 1.0
 
     def _load_array(self, path):
         if path.endswith('.npy'):
@@ -280,7 +264,7 @@ class TeacherCache:
                     sk = 1.0
                 self.scales[k] = float(sk)
 
-    def prune_after_epoch1(self, labels_subset, indices_subset, seg_map, r_th=0.15, nmin_ratio=0.005):
+    def prune_after_warmup(self, labels_subset, indices_subset, seg_map, r_th=0.15, nmin_ratio=0.005):
         """
         依据式(11)：r_k 统计在覆盖域内“最自信”的占比；低于阈值则剪枝。
         """
@@ -342,61 +326,49 @@ class TeacherCache:
         """
         B = len(indices)
         device = self.device
-        # 阶段门控：s0=1[t<eta], s1=s2=1[t>=eta]
-        stage_flags = [ (t < eta), (t >= eta), (t >= eta) ]
-        # 覆盖矩阵
-        M = torch.tensor([[1,1,1],[0,1,1],[0,0,1]], dtype=torch.bool, device=device)  # (3,3)
-
-        # 类→段（H=0,M=1,T=2）
+        stage_flags = [(t < eta), (t >= eta), (t >= eta)]
+        M = torch.tensor([[1,1,1],[0,1,1],[0,0,1]], dtype=torch.bool, device=device)
+        
         C = self.ncls
-        # 这里 labels 为当前 batch 的标签；段由调用侧提供的全局映射更好。
-        # 为避免重复计算，这里只依赖标签 y：H/M/T 在训练前由外部注入 self.seg_label
-        seg_col = self.seg_label[labels]  # [B] in {0,1,2}
-
+        seg_col = self.seg_label[labels]
+        
         has_kd = torch.zeros(B, dtype=torch.bool, device=device)
-        z_mix  = torch.zeros(B, C, dtype=torch.float32, device=device)
-
-        # 取每个教师的 batch logits（缩放 + 温度），置于 device
+        z_mix = torch.zeros(B, C, dtype=torch.float32, device=device)
+        
         idx = indices.to(self.device).long() if isinstance(indices, torch.Tensor) \
-        else torch.as_tensor(indices, device=self.device, dtype=torch.long)
-
-        Z = []
+              else torch.as_tensor(indices, device=self.device, dtype=torch.long)
+        
+        # 仅构建 Z_dict（删除冗余的 Z）
+        Z_dict = {}
         for k in range(3):
             if self.present[k] and (not self.pruned[k]) and stage_flags[k]:
                 z_k = self.Z[k].index_select(0, idx) * self.scales[k]
-                z_k = z_k.to(device)
-                Z.append((k, z_k))
-            else:
-                Z.append((k, None))
-
+                Z_dict[k] = z_k
+        
         for i in range(B):
             col = int(seg_col[i])
             active = []
-            for k,(kk,z_k) in enumerate(Z):
-                if z_k is None: continue
-                if M[kk, col]:
-                    active.append(kk)
-            if len(active)==0:
+            for k in range(3):
+                if k not in Z_dict:
+                    continue
+                if M[k, col]:
+                    active.append(k)
+            
+            if len(active) == 0:
                 continue
+            
             has_kd[i] = True
-            # u_k = p_k(y|x)
             y = int(labels[i].item())
-            u_vals = []
-            for kk,_ in enumerate(active):
-                z = Z[active[kk]][1][i]  # [C]
-                pk = F.softmax(z / self.T, dim=-1)
-                u_vals.append(pk[y].item())
-            # α_k ∝ exp(a u_k)，a=1
-            a = 1.0
-            alpha = torch.softmax(torch.tensor(u_vals, device=device) * a, dim=0)  # [m]
-            # 等价的 logit 混合：z* = sum α_k * (z_k/T)
-            zstar = 0.0
-            for j, kk in enumerate(active):
-                z = Z[kk][1][i] / self.T
-                zstar = zstar + alpha[j] * z
+            
+            z_active = torch.stack([Z_dict[k][i] for k in active])
+            p_active = F.softmax(z_active / self.T, dim=-1)
+            u_vals = p_active[:, y]
+            
+            alpha = F.softmax(u_vals, dim=0)
+            zstar = (alpha.unsqueeze(-1) * z_active / self.T).sum(0)
             z_mix[i] = zstar
-
-        p_star = F.softmax(z_mix, dim=-1)  # 即式(7) 中 p*
+        
+        p_star = F.softmax(z_mix, dim=-1)
         return has_kd, p_star
 
 # -------------------- 评测（保持与原版一致） --------------------
@@ -523,21 +495,19 @@ def train(cfg):
     torch.backends.cudnn.benchmark = True
     set_seed(cfg['seed'])
 
-    # 输出目录（与原保持：若给 lt_dir 就写入该目录）
     output_dir = pathlib.Path(cfg.get("out_dir") or ".")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    u_loader, r_loader, val_loader, labels, diff_sp, bt_loader, indices_subset, n_full = cifar_loaders(cfg)
+
+    u_loader, val_loader, labels, indices_subset, n_full = cifar_loaders(cfg)
     seg_map = seg_split(labels)
     ncls = cfg['num_classes']
 
-    # 类→段映射（0:H,1:M,2:T），供教师融合使用
     seg_label = torch.full((ncls,), 0, dtype=torch.long)
     seg_label[torch.tensor(seg_map['head'])] = 0
     seg_label[torch.tensor(seg_map['mid'])]  = 1
     seg_label[torch.tensor(seg_map['tail'])] = 2
 
-    # 模型
     model = Student(ncls, rho=cfg['rho']).cuda()
     opt = torch.optim.SGD(model.parameters(), cfg['lr'], momentum=0.9, weight_decay=5e-4)
     try:
@@ -547,164 +517,138 @@ def train(cfg):
     tb = SummaryWriter(comment=cfg['dataset'])
     global_step = 0
 
-    # 离线教师
     teachers = TeacherCache(
         paths=[cfg.get('t0_path'), cfg.get('t1_path'), cfg.get('t2_path')],
         n_full=n_full, ncls=ncls, temperature=cfg['temperature'],
         delta_s=cfg['delta_s'], device=device
     )
     teachers.seg_label = seg_label.cuda()
-    # 教师缩放 s_k
     teachers.compute_scales(indices_subset)
 
-    # 类平衡权重（式(14)）
     cls_cnt = np.bincount(labels, minlength=ncls)
     w_cb = np.array([(1 - cfg['beta']) / (1 - cfg['beta'] ** max(1, c)) for c in cls_cnt], dtype=np.float32)
     w_cb = torch.from_numpy(w_cb).cuda()
 
-    # 全局阈值 τ 的估计缓存（每 epoch 用 u_loader 覆盖一次）
     ent_epoch = np.zeros(len(indices_subset), dtype=np.float32)
     tau = float('inf'); tau_ready = False
 
     best_tail = 0.0
-    plateau = 0
 
     for ep in range(cfg['epochs']):
         model.train()
         meter = AverageMeter()
         pbar = tqdm.tqdm(u_loader, desc=f'E{ep}')
         tic = time.time()
-
+        
+        ent_epoch.fill(0.0)
+        count_epoch = np.zeros_like(ent_epoch)
+        
+        if ep == 0:
+            inv_map = torch.full((n_full,), -1, dtype=torch.long, device='cpu')
+            inv_map[torch.from_numpy(indices_subset)] = torch.arange(len(indices_subset))
+        
         for batch in pbar:
-            x, y, gi = batch  # gi: global index in full train set
-            x = x.cuda(non_blocking=True); y = y.cuda(non_blocking=True)
+            x, y, gi = batch
+            x = x.cuda(non_blocking=True)
+            y = y.cuda(non_blocking=True)
             gi = gi.cuda(non_blocking=True)
-
-            # 训练进度 t ∈ [0,1]
+            
             t = (ep + global_step / max(1, len(u_loader))) / max(1, cfg['epochs'] - 1)
             t = float(np.clip(t, 0.0, 1.0))
+            
             with autocast('cuda', enabled=cfg['amp']):
                 z = model.backbone(x)
-                logit_s0 = model.s0(z)     # [B,C]
-                logit_ad = model.adp(z)    # [B,C]
-                if model.use_s1:
-                    logit_s1 = model.s1(z)
-
+                logit_s0 = model.s0(z)
+                logit_ad = model.adp(z)
+                
                 p0 = F.softmax(logit_s0, -1)
-                # 教师融合（式(7)）：has_kd, p*
                 has_kd, p_star = teachers.fused_target(gi, y, t, cfg['eta'])
-                # 参考分布（式(8)）：有 KD 时用 p*，否则用 p0
                 p_ref = torch.where(has_kd.unsqueeze(-1), p_star, p0)
-
-                # 更新本 epoch 的样本熵，用于 τ 估计
-                d = -(p_ref * (p_ref+1e-12).log()).sum(-1)  # [B]
-                # 写回数组（按子集顺序位置）。gi 是 full 索引，需要映射到子集位置：
-                # 这里子集是 indices_subset；用哈希表加速
-                # 为避免构建 dict 的开销，我们预构建一次：
-                if global_step == 0 and pbar.n == 0 and ep == 0:
-                    # 第一次进入，构建 full_idx -> subpos 映射
-                    inv_map = {int(g): i for i, g in enumerate(indices_subset.tolist())}
-                    train.inv_map = inv_map  # 动态挂到函数命名空间（本地可见）
-                idx_pos = torch.tensor([train.inv_map[int(g.item())] for g in gi], device='cpu')
-                ent_epoch[idx_pos.cpu().numpy()] = d.detach().cpu().numpy()
-
-                # 触发器（式(10)）：d(x,t) > τ
-                tau_tensor = torch.full_like(d, fill_value= model.tau if tau_ready else float('inf'))
+                
+                d = -(p_ref * (p_ref+1e-12).log()).sum(-1)
+                idx_pos = inv_map[gi.cpu()]
+                assert (idx_pos >= 0).all(), "Invalid global index"
+                idx_np = idx_pos.cpu().numpy()
+                ent_epoch[idx_np] += d.detach().cpu().numpy()
+                count_epoch[idx_np] += 1
+                
+                tau_tensor = torch.full_like(d, fill_value=model.tau if tau_ready else float('inf'))
                 trig = (d > tau_tensor).float().unsqueeze(-1)
-
-                # 学生混合（式(9)）
-                if model.use_s1:
-                    p1 = F.softmax(logit_s1, -1)
-                    pS = torch.where(trig.bool(), (1-cfg['rho'])*p0 + cfg['rho']*p1, p0)
-                else:
-                    pC = F.softmax(logit_ad, -1)
-                    pS = torch.where(trig.bool(), (1-cfg['rho'])*p0 + cfg['rho']*pC, p0)
+                
+                pC = F.softmax(logit_ad, -1)
+                pS = torch.where(trig.bool(), (1-cfg['rho'])*p0 + cfg['rho']*pC, p0)
                 logpS = (pS + 1e-12).log()
-
-                # KD 权重 λ̃(x,t)（式(12)）
+                
                 lam_t = cfg['lambda_max'] * 0.5 * (1 - math.cos(math.pi * t))
-                lam_mask = has_kd.float()  # [B]
-                # KL(P* || P^S)，忽略常数项 sum p* log p*
-                kd_loss = -(p_star * logpS).sum(-1) * lam_mask * (cfg['temperature']**2)  # [B]
-                # CBFocal（式(13)）
-                py = torch.gather(pS, 1, y.view(-1,1)).squeeze(1)  # [B]
-                wy = w_cb[y]  # [B]
-                cb = - wy * ((1 - py).clamp_min(1e-12) ** cfg['gamma']) * (py + 1e-12).log()  # [B]
-                # 总损失（式(12)）：lam(t) * I[has_kd] 和 (1 - lam(t)*I)
+                lam_mask = has_kd.float()
+                kd_loss = -(p_star * logpS).sum(-1) * lam_mask * (cfg['temperature']**2)
+                
+                py = torch.gather(pS, 1, y.view(-1,1)).squeeze(1)
+                wy = w_cb[y]
+                cb = - wy * ((1 - py).clamp_min(1e-12) ** cfg['gamma']) * (py + 1e-12).log()
+                
                 L = lam_t * kd_loss + (1 - lam_t * lam_mask) * cb
                 loss = L.mean()
-
+            
             scaler.scale(loss).backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-            scaler.step(opt); scaler.update(); opt.zero_grad(set_to_none=True)
-
+            scaler.step(opt)
+            scaler.update()
+            opt.zero_grad(set_to_none=True)
+            
             meter.update(loss.item(), x.size(0))
             pbar.set_postfix(loss=f'{meter.avg:.3f}')
-            # 记录
+            
             if tb:
-                tb.add_scalar('train/loss',         loss.item(), global_step)
-                tb.add_scalar('train/lam_t',        lam_t,        global_step)
-                tb.add_scalar('train/p_act_batch',  trig.float().mean().item(), global_step)
+                tb.add_scalar('train/loss', loss.item(), global_step)
+                tb.add_scalar('train/lam_t', lam_t, global_step)
+                tb.add_scalar('train/p_act_batch', trig.float().mean().item(), global_step)
             global_step += 1
-
-        # ====== 每 epoch 结束：估计/更新 τ（式(9) 之前的定义 + 式(10) 的 EMA）======
-        q = float(np.quantile(ent_epoch, cfg['tau_pct'] / 100.0))
+        
+        valid_mask = count_epoch > 0
+        ent_epoch[valid_mask] /= count_epoch[valid_mask]
+        
+        q = float(np.quantile(ent_epoch[valid_mask], cfg['tau_pct'] / 100.0))
         if not tau_ready:
             tau = q
             tau_ready = True
         else:
             tau = cfg['mu'] * tau + (1 - cfg['mu']) * q
         model.tau = float(tau)
-        if tb: tb.add_scalar('train/tau', model.tau, ep)
-
-        # ====== 一轮后剪枝（式(11)）======
-        if ep == 0:
-            teachers.pruned = [False, False, False]  # 保守：首轮不剪
-        elif ep == 1:
-            teachers.prune_after_epoch1(labels_subset=labels, indices_subset=indices_subset,
-                                        seg_map=seg_map, r_th=cfg['r_th'], nmin_ratio=cfg['nmin_ratio'])
-
-        # ====== 验证 ======
+        if tb:
+            tb.add_scalar('train/tau', model.tau, ep)
+        
+        if ep == 0 and cfg.get('do_teacher_pruning', True):
+            teachers.prune_after_warmup(
+                labels_subset=labels,
+                indices_subset=indices_subset,
+                seg_map=seg_map,
+                r_th=cfg['r_th'],
+                nmin_ratio=cfg['nmin_ratio']
+            )
+        
         metr = evaluate(model, val_loader, seg_map, tb, ep, amp=cfg['amp'])
         write_csv(cfg | {"epochs": ep + 1}, metr, output_dir / "results.csv")
         write_result(cfg | {"epochs": ep + 1}, metr, output_dir / "results.md")
+        
 
-        # 更新 DifficultySampler（与原一致；即便未用于训练，也按原逻辑维护）
-        if cfg['lambda_rs'] > 0:
-            entr_epoch = ent_epoch.copy()  # 已按 p_ref 计算
-            if not hasattr(diff_sp, 'ce_hist'):
-                diff_sp.ce_hist = entr_epoch.copy()
-            diff_sp.ce_hist = 0.9 * diff_sp.ce_hist + 0.1 * entr_epoch
-            diff_sp.update(diff_sp.ce_hist, entr_epoch)
-
-        # 早停触发器：尾段停滞 E 次 → 启用 S1（保留同一混合规则）
         tail_acc = metr['tail_acc'] if np.isfinite(metr['tail_acc']) else 0.0
         if tail_acc > best_tail + 1e-6:
-            best_tail = tail_acc; plateau = 0
+            best_tail = tail_acc
             torch.save(model.state_dict(), output_dir / "best_tail.pth")
-        else:
-            plateau += 1
-            if plateau >= cfg['E'] and (not model.use_s1):
-                model.use_s1 = True
-                print(">> Escalate: enable S1 (second student) due to tail plateau.")
-
+        
         toc = time.time() - tic
         print(
             f"Epoch {ep+1}/{cfg['epochs']} | "
             f"train_loss {meter.avg:.4f} | "
-            f"val {fmt(metr['acc_all'])}/{fmt(metr['auc_all'])}/{fmt(metr['gmean_all'])}/{fmt(metr['f1_all'])} | "
-            f"H {fmt(metr['head_acc'])}/{fmt(metr['head_auc'])}/{fmt(metr['head_gmean'])}/{fmt(metr['head_f1'])} | "
-            f"M {fmt(metr['mid_acc'])}/{fmt(metr['mid_auc'])}/{fmt(metr['mid_gmean'])}/{fmt(metr['mid_f1'])} | "
-            f"T {fmt(metr['tail_acc'])}/{fmt(metr['tail_auc'])}/{fmt(metr['tail_gmean'])}/{fmt(metr['tail_f1'])} | "
+            f"val {fmt(metr['acc_all'])}/{fmt(metr['tail_acc'])} | "
             f"τ {model.tau:.4f} | t {toc:.1f}s"
         )
-
-    # 保存最终模型（推理不带教师）
+    
     torch.save(model.state_dict(), output_dir / "final.pth")
     write_result(cfg, metr, file_path=output_dir / "results.md")
     write_csv(cfg, metr, file_path=output_dir / "results.csv")
     tb.close()
-
 # -------------------- CLI --------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -735,7 +679,6 @@ if __name__ == "__main__":
     parser.add_argument('--rho', type=float, default=0.2)           # 适配器混合系数
     parser.add_argument('--tau_pct', type=float, default=80.0)      # 分位数
     parser.add_argument('--mu', type=float, default=0.95)           # τ 的 EMA 系数
-    parser.add_argument('--E', type=int, default=2)                 # 尾段停滞轮数后启用 S1
 
     # 损失
     parser.add_argument('--lambda_max', type=float, default=0.7)    # KD 最大权重
@@ -766,7 +709,6 @@ if __name__ == "__main__":
         'rho': args.rho,
         'tau_pct': args.tau_pct,
         'mu': args.mu,
-        'E': args.E,
         'lambda_max': args.lambda_max,
         'beta': args.beta,
         'gamma': args.gamma,
@@ -774,3 +716,4 @@ if __name__ == "__main__":
         'out_dir': args.out_dir,
     }
     train(cfg)
+
