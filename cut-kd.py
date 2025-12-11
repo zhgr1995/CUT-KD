@@ -210,7 +210,7 @@ class TeacherCache:
     以 numpy/pt 载入离线教师 logits：形状 [N_train_full, C]，对应原始训练集全索引。
     训练实际使用长尾子集 indices 时按 global_idx 切片。
     """
-    def __init__(self, paths, n_full, ncls, temperature=3.0, delta_s=0.05, device='cuda'):
+    def __init__(self, paths, n_full, ncls, temperature=3.0, delta_s=0.05, utility_scale=1.0, device='cuda'):
         """
         paths: [path_t0, path_t1, path_t2] (可为 None 表示不存在某教师)
         """
@@ -223,6 +223,7 @@ class TeacherCache:
         self.present = [False, False, False]
         self.pruned = [False, False, False]
         self.scales = [1.0, 1.0, 1.0]
+        self.utility_scale = float(utility_scale)
         self.Z = [None, None, None]  # CPU tensors
         for k, p in enumerate(paths):
             if p is None: 
@@ -328,7 +329,7 @@ class TeacherCache:
         device = self.device
         stage_flags = [(t < eta), (t >= eta), (t >= eta)]
         M = torch.tensor([[1,1,1],[0,1,1],[0,0,1]], dtype=torch.bool, device=device)
-        
+
         C = self.ncls
         seg_col = self.seg_label[labels]
         
@@ -364,7 +365,7 @@ class TeacherCache:
             p_active = F.softmax(z_active / self.T, dim=-1)
             u_vals = p_active[:, y]
             
-            alpha = F.softmax(u_vals, dim=0)
+            alpha = F.softmax(self.utility_scale * u_vals, dim=0)
             zstar = (alpha.unsqueeze(-1) * z_active / self.T).sum(0)
             z_mix[i] = zstar
         
@@ -520,7 +521,7 @@ def train(cfg):
     teachers = TeacherCache(
         paths=[cfg.get('t0_path'), cfg.get('t1_path'), cfg.get('t2_path')],
         n_full=n_full, ncls=ncls, temperature=cfg['temperature'],
-        delta_s=cfg['delta_s'], device=device
+        delta_s=cfg['delta_s'], utility_scale=cfg['utility_scale'], device=device  # 新增 utility_scale
     )
     teachers.seg_label = seg_label.cuda()
     teachers.compute_scales(indices_subset)
@@ -553,7 +554,7 @@ def train(cfg):
             y = y.cuda(non_blocking=True)
             gi = gi.cuda(non_blocking=True)
             
-            t = (ep + global_step / max(1, len(u_loader))) / max(1, cfg['epochs'] - 1)
+            t = ep / max(1, cfg['epochs'] - 1)
             t = float(np.clip(t, 0.0, 1.0))
             
             with autocast('cuda', enabled=cfg['amp']):
@@ -669,8 +670,9 @@ if __name__ == "__main__":
     parser.add_argument('--t0_path', type=str, default=None, help='T0 logits path [.npy/.pt]')
     parser.add_argument('--t1_path', type=str, default=None, help='T1 logits path [.npy/.pt]')
     parser.add_argument('--t2_path', type=str, default=None, help='T2 logits path [.npy/.pt]')
-    parser.add_argument('--temperature', type=float, default=3.0)   # T
+    parser.add_argument('--temperature', type=float, default=4.0)   # T
     parser.add_argument('--delta_s', type=float, default=0.05)      # |s_k-1|<δ_s → s_k=1
+    parser.add_argument('--utility_scale', type=float, default=1.0) # 论文 Eq.7 中的 a 参数
     parser.add_argument('--eta', type=float, default=0.5)           # 阶段分界
     parser.add_argument('--r_th', type=float, default=0.15)         # 剪枝阈值
     parser.add_argument('--nmin_ratio', type=float, default=0.005)  # 证据下限占比
@@ -703,6 +705,7 @@ if __name__ == "__main__":
         't0_path': args.t0_path, 't1_path': args.t1_path, 't2_path': args.t2_path,
         'temperature': args.temperature,
         'delta_s': args.delta_s,
+        'utility_scale': args.utility_scale,
         'eta': args.eta,
         'r_th': args.r_th,
         'nmin_ratio': args.nmin_ratio,
@@ -716,4 +719,5 @@ if __name__ == "__main__":
         'out_dir': args.out_dir,
     }
     train(cfg)
+
 
