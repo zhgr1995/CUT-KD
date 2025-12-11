@@ -582,7 +582,7 @@ def train(cfg):
                 
                 lam_t = cfg['lambda_max'] * 0.5 * (1 - math.cos(math.pi * t))
                 lam_mask = has_kd.float()
-                kd_loss = -(p_star * logpS).sum(-1) * lam_mask * (cfg['temperature']**2)
+                kd_loss = (p_star * ((p_star + 1e-12).log() - logpS)).sum(-1) * lam_mask * (cfg['temperature']**2)
                 
                 py = torch.gather(pS, 1, y.view(-1,1)).squeeze(1)
                 wy = w_cb[y]
@@ -719,5 +719,6 @@ if __name__ == "__main__":
         'out_dir': args.out_dir,
     }
     train(cfg)
+
 
 
